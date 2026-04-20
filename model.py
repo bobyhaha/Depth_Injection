@@ -13,10 +13,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-# pip install -q datasets transformers sentencepiece tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
+import wandb
 
 
 # ============================================================
@@ -29,7 +29,7 @@ class Config:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision: bool = True
-    compile_model: bool = False  # can help on Linux/PyTorch 2.x, but optional
+    compile_model: bool = False
 
     # Dataset / tokenizer
     dataset_name: str = "tinystories"
@@ -48,7 +48,7 @@ class Config:
 
     # Preprocessing
     preprocess_batch_size: int = 1024
-    num_proc: int = 8  # for HF map preprocessing
+    num_proc: int = 8
 
     # Training
     batch_size: int = 32
@@ -66,7 +66,7 @@ class Config:
     num_workers: int = 4
     pin_memory: bool = True
 
-    # GPT-2-like main model
+    # GPT-like model
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 8
@@ -74,20 +74,19 @@ class Config:
     d_ff: int = 2048
     dropout: float = 0.1
 
-    # Ablation:
-    #   none       -> no M(x,l)
-    #   identity   -> inject original token embedding x0 directly
-    #   mlp        -> M(x,l) is an MLP with diffusion-style layer embedding
-    #   tiny_tf    -> M(x,l) is a tiny 2-layer transformer over x0 + layer cond
+    # Ablations
+    #   none      -> no M(x,l)
+    #   identity  -> inject x0 directly
+    #   mlp       -> MLP-based depth-conditioned signal
+    #   tiny_tf   -> tiny Transformer-based depth-conditioned signal
     injection_mode: str = "mlp"
 
-    # Injection style
-    #   add      -> h = h + scale * m
-    #   gate     -> h = h + scale * sigmoid(g(h,m)) * m
+    #   add       -> h = h + scale * m
+    #   gate      -> h = h + scale * sigmoid(g(h,m)) * m
     injection_type: str = "add"
     injection_scale_init: float = 0.1
 
-    # Diffusion-style layer embedding
+    # Layer embedding for depth conditioning
     layer_embed_dim: int = 128
     layer_embed_mlp_dim: int = 256
 
@@ -97,7 +96,16 @@ class Config:
     m_num_layers: int = 2
     m_num_heads: int = 4
 
-    # Misc
+    # W&B
+    use_wandb: bool = True
+    wandb_project: str = "depth-injection"
+    wandb_entity: Optional[str] = None
+    wandb_group: str = "tinystories-ablation"
+    wandb_job_type: str = "train"
+    wandb_tags: Tuple[str, ...] = ("tinystories", "ablation")
+    wandb_mode: str = "online"   # online, offline, disabled
+
+    # Run naming
     run_name: Optional[str] = None
 
 
@@ -143,6 +151,14 @@ class CosineWarmupScheduler:
 def build_run_name(cfg: Config) -> str:
     if cfg.run_name is not None:
         return cfg.run_name
+
+    if cfg.injection_mode == "none":
+        return (
+            f"{cfg.dataset_name}_none_"
+            f"L{cfg.n_layer}_H{cfg.n_head}_D{cfg.d_model}_"
+            f"FF{cfg.d_ff}_BS{cfg.batch_size}_T{cfg.text_block_size}"
+        )
+
     return (
         f"{cfg.dataset_name}_"
         f"{cfg.injection_mode}_{cfg.injection_type}_"
@@ -151,20 +167,38 @@ def build_run_name(cfg: Config) -> str:
     )
 
 
+def maybe_init_wandb(cfg: Config, run_name: str):
+    if not cfg.use_wandb or cfg.wandb_mode == "disabled":
+        return None
+
+    wandb_run = wandb.init(
+        project=cfg.wandb_project,
+        entity=cfg.wandb_entity,
+        name=run_name,
+        group=cfg.wandb_group,
+        job_type=cfg.wandb_job_type,
+        tags=list(cfg.wandb_tags),
+        config=asdict(cfg),
+        mode=cfg.wandb_mode,
+    )
+    return wandb_run
+
+
+def maybe_log_wandb(data: Dict[str, Any], step: int):
+    if wandb.run is not None:
+        wandb.log(data, step=step)
+
+
+def maybe_finish_wandb():
+    if wandb.run is not None:
+        wandb.finish()
+
+
 # ============================================================
 # Tokenization / preprocessing to memmap
 # ============================================================
 
 def preprocess_tinystories_to_memmap(cfg: Config):
-    """
-    Downloads TinyStories from Hugging Face, tokenizes train/validation,
-    and writes:
-      - train.bin (uint16)
-      - val.bin   (uint16)
-      - meta.json
-
-    This is a one-time preprocessing step.
-    """
     ensure_dir(cfg.data_dir)
     ensure_dir(cfg.tokenized_dir)
 
@@ -179,7 +213,11 @@ def preprocess_tinystories_to_memmap(cfg: Config):
         return meta
 
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.tokenizer_name,
+        use_fast=True,
+        model_max_length=10**9,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -190,13 +228,13 @@ def preprocess_tinystories_to_memmap(cfg: Config):
     print("Loading TinyStories dataset from Hugging Face...")
     ds = load_dataset(cfg.hf_dataset_name)
 
-    # We'll tokenize into lists of ids, then flatten efficiently.
     def tok_fn(batch):
         texts = batch["text"]
         out = tokenizer(
             texts,
             add_special_tokens=False,
             return_attention_mask=False,
+            truncation=False,
         )["input_ids"]
 
         if cfg.add_eos_between_docs:
@@ -229,7 +267,6 @@ def preprocess_tinystories_to_memmap(cfg: Config):
     print(f"Train tokens: {train_n_tokens:,}")
     print(f"Val tokens:   {val_n_tokens:,}")
 
-    # GPT-2 vocab size fits in uint16 (50257 < 65535)
     dtype = np.uint16
     train_arr = np.memmap(train_bin, dtype=dtype, mode="w+", shape=(train_n_tokens,))
     val_arr = np.memmap(val_bin, dtype=dtype, mode="w+", shape=(val_n_tokens,))
@@ -272,9 +309,6 @@ def preprocess_tinystories_to_memmap(cfg: Config):
 # ============================================================
 
 class MemmapTokenDataset(Dataset):
-    """
-    Samples random contiguous LM training blocks from a token memmap.
-    """
     def __init__(self, bin_path: str, block_size: int):
         self.bin_path = bin_path
         self.block_size = block_size
@@ -285,13 +319,8 @@ class MemmapTokenDataset(Dataset):
         return max(0, self.n_tokens - self.block_size - 1)
 
     def __getitem__(self, idx):
-        # idx provided by DataLoader when shuffle=True
-        x = torch.from_numpy(
-            np.array(self.data[idx: idx + self.block_size], dtype=np.int64)
-        )
-        y = torch.from_numpy(
-            np.array(self.data[idx + 1: idx + self.block_size + 1], dtype=np.int64)
-        )
+        x = torch.from_numpy(np.array(self.data[idx: idx + self.block_size], dtype=np.int64))
+        y = torch.from_numpy(np.array(self.data[idx + 1: idx + self.block_size + 1], dtype=np.int64))
         return x, y
 
 
@@ -313,11 +342,6 @@ def build_datasets(cfg: Config):
 # ============================================================
 
 class SinusoidalLayerEmbedding(nn.Module):
-    """
-    Diffusion-style timestep embedding but for discrete layer index l.
-    Input: integer layer index shape [B]
-    Output: embedding shape [B, dim]
-    """
     def __init__(self, dim: int, mlp_dim: int):
         super().__init__()
         self.dim = dim
@@ -345,7 +369,7 @@ class SinusoidalLayerEmbedding(nn.Module):
 
 
 # ============================================================
-# Main GPT-2-like components
+# Main GPT components
 # ============================================================
 
 class CausalSelfAttention(nn.Module):
@@ -357,7 +381,6 @@ class CausalSelfAttention(nn.Module):
 
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
 
@@ -371,7 +394,9 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
         y = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_mask=None,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
             is_causal=True,
@@ -554,10 +579,7 @@ class DepthConditionedGPT(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1),
-            )
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
 
@@ -644,6 +666,7 @@ def save_loss_plot(history: Dict[str, List[Any]], title: str, log_dir: str):
     plt.savefig(fig_path, bbox_inches="tight")
     plt.close()
     print(f"Saved loss plot to {fig_path}")
+    return fig_path
 
 
 def train_one_run(cfg: Config):
@@ -675,20 +698,24 @@ def train_one_run(cfg: Config):
         drop_last=False,
     )
 
+    run_name = build_run_name(cfg)
+    wandb_run = maybe_init_wandb(cfg, run_name)
+
     model = DepthConditionedGPT(cfg).to(device)
     if cfg.compile_model and hasattr(torch, "compile"):
         model = torch.compile(model)
 
     optimizer = make_optimizer(model, cfg)
     scheduler = CosineWarmupScheduler(optimizer, cfg.warmup_steps, cfg.max_steps, cfg.lr, cfg.min_lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.mixed_precision and device.type == "cuda"))
+
+    use_amp = cfg.mixed_precision and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Train tokens: {meta['train_tokens']:,}")
     print(f"Val tokens:   {meta['val_tokens']:,}")
     print(f"Model parameters: {n_params / 1e6:.2f}M")
 
-    run_name = build_run_name(cfg)
     run_dir = os.path.join(cfg.out_dir, run_name)
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     log_dir = os.path.join(run_dir, "logs")
@@ -697,6 +724,12 @@ def train_one_run(cfg: Config):
 
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(asdict(cfg), f, indent=2)
+
+    if wandb_run is not None:
+        wandb.summary["train_tokens"] = meta["train_tokens"]
+        wandb.summary["val_tokens"] = meta["val_tokens"]
+        wandb.summary["model_parameters"] = n_params
+        wandb.summary["run_dir"] = run_dir
 
     history = {
         "step": [],
@@ -721,12 +754,12 @@ def train_one_run(cfg: Config):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=(cfg.mixed_precision and device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             _, loss = model(x, y)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
@@ -741,7 +774,17 @@ def train_one_run(cfg: Config):
             history["val_loss"].append(None)
             history["val_ppl"].append(None)
             history["lr"].append(float(lr))
+
             print(f"step {step:6d} | train loss {train_loss_value:.4f} | lr {lr:.6e}")
+            maybe_log_wandb(
+                {
+                    "train/loss": train_loss_value,
+                    "train/lr": float(lr),
+                    "train/grad_norm": float(grad_norm),
+                    "global_step": step,
+                },
+                step=step,
+            )
 
         if step % cfg.eval_interval == 0 or step == cfg.max_steps:
             metrics = estimate_loss(model, val_loader, device, max_batches=cfg.eval_steps)
@@ -755,6 +798,16 @@ def train_one_run(cfg: Config):
             history["lr"].append(float(lr))
 
             print(f"[eval] step {step:6d} | val loss {val_loss:.4f} | val ppl {val_ppl:.2f}")
+
+            maybe_log_wandb(
+                {
+                    "eval/loss": val_loss,
+                    "eval/ppl": val_ppl,
+                    "eval/best_val_loss_so_far": min(best_val, val_loss),
+                    "global_step": step,
+                },
+                step=step,
+            )
 
             if val_loss < best_val:
                 best_val = val_loss
@@ -770,9 +823,23 @@ def train_one_run(cfg: Config):
                 torch.save(ckpt, best_path)
                 print(f"Saved checkpoint to {best_path}")
 
+                if wandb_run is not None:
+                    wandb.summary["best_val_loss"] = best_val
+                    wandb.summary["best_step"] = step
+                    wandb.summary["best_checkpoint"] = best_path
+
     save_history(history, log_dir)
-    save_loss_plot(history, run_name, log_dir)
-    return model, history
+    loss_png_path = save_loss_plot(history, run_name, log_dir)
+
+    if wandb_run is not None and os.path.exists(loss_png_path):
+        wandb.log({"plots/loss_curve": wandb.Image(loss_png_path)})
+        wandb.save(os.path.join(run_dir, "config.json"))
+        wandb.save(os.path.join(log_dir, "history.csv"))
+        wandb.save(os.path.join(log_dir, "history.json"))
+        wandb.save(loss_png_path)
+
+    maybe_finish_wandb()
+    return model, history, run_dir
 
 
 # ============================================================
@@ -787,24 +854,33 @@ def run_ablation_suite(base_cfg: Config):
         print("\n" + "=" * 80)
         print(f"Running ablation: injection_mode = {mode}")
         print("=" * 80)
+
         cfg = Config(**asdict(base_cfg))
         cfg.injection_mode = mode
-        _, history = train_one_run(cfg)
-        results[mode] = history
+        cfg.run_name = None
+        cfg.wandb_group = base_cfg.wandb_group
+
+        _, history, run_dir = train_one_run(cfg)
+        results[build_run_name(cfg)] = {
+            "history": history,
+            "run_dir": run_dir,
+            "mode": mode,
+        }
 
     return results
 
 
-def plot_ablation_results(results, save_path="ablation_compare.png"):
-    plt.figure(figsize=(9, 6))
-    for mode, history in results.items():
+def plot_ablation_results(results: Dict[str, Dict[str, Any]], save_path: str):
+    plt.figure(figsize=(10, 6))
+    for run_name, result in results.items():
+        history = result["history"]
         val_steps = [s for s, v in zip(history["step"], history["val_loss"]) if v is not None]
         val_losses = [v for v in history["val_loss"] if v is not None]
-        plt.plot(val_steps, val_losses, label=f"{mode} val")
+        plt.plot(val_steps, val_losses, label=run_name)
 
     plt.xlabel("step")
     plt.ylabel("validation loss")
-    plt.title("Ablation comparison")
+    plt.title("TinyStories ablation comparison")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig(save_path, bbox_inches="tight")
@@ -812,30 +888,54 @@ def plot_ablation_results(results, save_path="ablation_compare.png"):
     print(f"Saved ablation comparison plot to {save_path}")
 
 
-# ============================================================
-# Sample generation
-# ============================================================
 
-@torch.no_grad()
-def generate(model, tokenizer, prompt: str, max_new_tokens: int = 100, temperature: float = 1.0, top_k: Optional[int] = 50):
-    device = next(model.parameters()).device
-    model.eval()
+def save_ablation_summary(results: Dict[str, Dict[str, Any]], save_path: str):
+    rows = []
+    for run_name, result in results.items():
+        history = result["history"]
+        val_pairs = [(s, v) for s, v in zip(history["step"], history["val_loss"]) if v is not None]
+        ppl_values = [v for v in history["val_ppl"] if v is not None]
 
-    idx = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
-    for _ in range(max_new_tokens):
-        idx_cond = idx[:, -model.cfg.max_seq_len:]
-        logits, _ = model(idx_cond)
-        logits = logits[:, -1, :] / max(temperature, 1e-6)
+        if len(val_pairs) == 0:
+            best_step, best_val = None, None
+            final_val = None
+            final_ppl = None
+        else:
+            best_step, best_val = min(val_pairs, key=lambda x: x[1])
+            final_val = val_pairs[-1][1]
+            final_ppl = ppl_values[-1] if len(ppl_values) > 0 else None
 
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float("inf")
+        rows.append(
+            {
+                "run_name": run_name,
+                "mode": result["mode"],
+                "best_val_loss": best_val,
+                "best_step": best_step,
+                "final_val_loss": final_val,
+                "final_val_ppl": final_ppl,
+                "run_dir": result["run_dir"],
+            }
+        )
 
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        idx = torch.cat([idx, next_token], dim=1)
+    rows.sort(key=lambda x: float("inf") if x["best_val_loss"] is None else x["best_val_loss"])
 
-    return tokenizer.decode(idx[0].tolist())
+    with open(save_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "run_name",
+                "mode",
+                "best_val_loss",
+                "best_step",
+                "final_val_loss",
+                "final_val_ppl",
+                "run_dir",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved ablation summary to {save_path}")
 
 
 # ============================================================
@@ -847,49 +947,63 @@ if __name__ == "__main__":
         dataset_name="tinystories",
         hf_dataset_name="roneneldan/TinyStories",
         tokenizer_name="gpt2",
-
         data_dir="./data_tinystories",
         tokenized_dir="./data_tinystories/tokenized",
         out_dir="./runs_tinystories",
-
         text_block_size=256,
         batch_size=32,
         eval_batch_size=32,
-
         n_layer=12,
         n_head=8,
         d_model=512,
         d_ff=2048,
         dropout=0.1,
-
         max_steps=20000,
         warmup_steps=500,
         eval_interval=500,
         eval_steps=100,
         log_interval=20,
-
-        injection_mode="mlp",   # change here, or use run_ablation_suite
         injection_type="add",
         injection_scale_init=0.1,
-
         m_hidden_dim=512,
         m_num_layers=2,
         m_num_heads=4,
-
         num_proc=8,
         num_workers=4,
         compile_model=False,
+        use_wandb=True,
+        wandb_project="depth-injection",
+        wandb_entity=None,
+        wandb_group="tinystories-ablation",
+        wandb_job_type="train",
+        wandb_tags=("tinystories", "ablation", "depth-injection"),
+        wandb_mode="online",
     )
 
-    # Single run:
-    model, history = train_one_run(cfg)
+    # pip install wandb
+    # wandb login
+    results = run_ablation_suite(cfg)
 
-    # Full ablation:
-    # results = run_ablation_suite(cfg)
-    # plot_ablation_results(results, save_path=os.path.join(cfg.out_dir, "ablation_compare.png"))
+    ablation_plot_path = os.path.join(cfg.out_dir, "ablation_compare.png")
+    ablation_summary_path = os.path.join(cfg.out_dir, "ablation_summary.csv")
 
-    # Example generation after training:
-    # tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name, use_fast=True)
-    # if tokenizer.pad_token is None:
-    #     tokenizer.pad_token = tokenizer.eos_token
-    # print(generate(model, tokenizer, "Once upon a time", max_new_tokens=120))
+    plot_ablation_results(results, save_path=ablation_plot_path)
+    save_ablation_summary(results, save_path=ablation_summary_path)
+
+    if cfg.use_wandb and cfg.wandb_mode != "disabled":
+        summary_run = wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name=f"{cfg.dataset_name}-ablation-summary",
+            group=cfg.wandb_group,
+            job_type="summary",
+            tags=list(cfg.wandb_tags) + ["summary"],
+            config=asdict(cfg),
+            mode=cfg.wandb_mode,
+        )
+        if os.path.exists(ablation_plot_path):
+            wandb.log({"plots/ablation_compare": wandb.Image(ablation_plot_path)})
+            wandb.save(ablation_plot_path)
+        if os.path.exists(ablation_summary_path):
+            wandb.save(ablation_summary_path)
+        wandb.finish()
