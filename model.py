@@ -66,7 +66,7 @@ class Config:
     num_workers: int = 4
     pin_memory: bool = True
 
-    # GPT-like model
+    # Main transformer
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 8
@@ -74,27 +74,40 @@ class Config:
     d_ff: int = 2048
     dropout: float = 0.1
 
-    # Ablations
-    #   none      -> no M(x,l)
-    #   identity  -> inject x0 directly
-    #   mlp       -> MLP-based depth-conditioned signal
-    #   tiny_tf   -> tiny Transformer-based depth-conditioned signal
-    injection_mode: str = "mlp"
+    # Injection family
+    #   none      : baseline transformer
+    #   original  : compute M(x,l) separately for each layer
+    #   shared    : compute shared M once after warmup layers, up-project to all later layers
+    injection_family: str = "original"
 
-    #   add       -> h = h + scale * m
-    #   gate      -> h = h + scale * sigmoid(g(h,m)) * m
+    # Where to start injecting for shared family.
+    # Example: warmup_layers=2 means first two layers are plain transformer,
+    # then shared side-model is computed and injected into layers 2..n_layer-1.
+    warmup_layers: int = 2
+
+    # Small M(x,l) architecture choices for ablation
+    #   mlp1, mlp2,
+    #   tf1, tf2,
+    #   tf1_nomlp, tf2_nomlp
+    m_variant: str = "mlp1"
+
+    # Injection operator
+    #   add  -> h = h + scale * m
+    #   gate -> h = h + scale * sigmoid(g(h,m)) * m
     injection_type: str = "add"
     injection_scale_init: float = 0.1
 
-    # Layer embedding for depth conditioning
+    # Depth conditioning for original family
     layer_embed_dim: int = 128
     layer_embed_mlp_dim: int = 256
 
-    # Small model M(x,l)
+    # Small model width / dropout
     m_hidden_dim: int = 512
     m_dropout: float = 0.1
-    m_num_layers: int = 2
     m_num_heads: int = 4
+
+    # Shared-family projector bottleneck
+    shared_projector_hidden_dim: int = 1024
 
     # W&B
     use_wandb: bool = True
@@ -102,7 +115,7 @@ class Config:
     wandb_entity: Optional[str] = None
     wandb_group: str = "tinystories-ablation"
     wandb_job_type: str = "train"
-    wandb_tags: Tuple[str, ...] = ("tinystories", "ablation")
+    wandb_tags: Tuple[str, ...] = ("tinystories", "ablation", "depth-injection")
     wandb_mode: str = "online"   # online, offline, disabled
 
     # Run naming
@@ -152,16 +165,10 @@ def build_run_name(cfg: Config) -> str:
     if cfg.run_name is not None:
         return cfg.run_name
 
-    if cfg.injection_mode == "none":
-        return (
-            f"{cfg.dataset_name}_none_"
-            f"L{cfg.n_layer}_H{cfg.n_head}_D{cfg.d_model}_"
-            f"FF{cfg.d_ff}_BS{cfg.batch_size}_T{cfg.text_block_size}"
-        )
-
     return (
         f"{cfg.dataset_name}_"
-        f"{cfg.injection_mode}_{cfg.injection_type}_"
+        f"{cfg.injection_family}_{cfg.m_variant}_{cfg.injection_type}_"
+        f"WU{cfg.warmup_layers}_"
         f"L{cfg.n_layer}_H{cfg.n_head}_D{cfg.d_model}_"
         f"FF{cfg.d_ff}_BS{cfg.batch_size}_T{cfg.text_block_size}"
     )
@@ -171,7 +178,7 @@ def maybe_init_wandb(cfg: Config, run_name: str):
     if not cfg.use_wandb or cfg.wandb_mode == "disabled":
         return None
 
-    wandb_run = wandb.init(
+    return wandb.init(
         project=cfg.wandb_project,
         entity=cfg.wandb_entity,
         name=run_name,
@@ -181,7 +188,6 @@ def maybe_init_wandb(cfg: Config, run_name: str):
         config=asdict(cfg),
         mode=cfg.wandb_mode,
     )
-    return wandb_run
 
 
 def maybe_log_wandb(data: Dict[str, Any], step: int):
@@ -209,8 +215,7 @@ def preprocess_tinystories_to_memmap(cfg: Config):
     if os.path.exists(train_bin) and os.path.exists(val_bin) and os.path.exists(meta_path):
         print("Found existing tokenized memmaps. Skipping preprocessing.")
         with open(meta_path, "r") as f:
-            meta = json.load(f)
-        return meta
+            return json.load(f)
 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -236,7 +241,6 @@ def preprocess_tinystories_to_memmap(cfg: Config):
             return_attention_mask=False,
             truncation=False,
         )["input_ids"]
-
         if cfg.add_eos_between_docs:
             out = [ids + [eos_id] for ids in out]
         return {"ids": out, "len": [len(x) for x in out]}
@@ -305,7 +309,7 @@ def preprocess_tinystories_to_memmap(cfg: Config):
 
 
 # ============================================================
-# Memmap dataset
+# Dataset
 # ============================================================
 
 class MemmapTokenDataset(Dataset):
@@ -331,14 +335,11 @@ def build_datasets(cfg: Config):
 
     train_bin = os.path.join(cfg.tokenized_dir, "train.bin")
     val_bin = os.path.join(cfg.tokenized_dir, "val.bin")
-
-    train_ds = MemmapTokenDataset(train_bin, cfg.text_block_size)
-    val_ds = MemmapTokenDataset(val_bin, cfg.text_block_size)
-    return train_ds, val_ds, meta
+    return MemmapTokenDataset(train_bin, cfg.text_block_size), MemmapTokenDataset(val_bin, cfg.text_block_size), meta
 
 
 # ============================================================
-# Positional + Layer Embeddings
+# Embeddings
 # ============================================================
 
 class SinusoidalLayerEmbedding(nn.Module):
@@ -369,20 +370,19 @@ class SinusoidalLayerEmbedding(nn.Module):
 
 
 # ============================================================
-# Main GPT components
+# Main transformer blocks
 # ============================================================
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, cfg: Config):
+    def __init__(self, d_model: int, n_head: int, dropout: float):
         super().__init__()
-        assert cfg.d_model % cfg.n_head == 0
-        self.n_head = cfg.n_head
-        self.head_dim = cfg.d_model // cfg.n_head
-
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-        self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-        self.attn_dropout = nn.Dropout(cfg.dropout)
-        self.resid_dropout = nn.Dropout(cfg.dropout)
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -394,9 +394,7 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
         y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             attn_mask=None,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
             is_causal=True,
@@ -406,14 +404,14 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(nn.Module):
-    def __init__(self, cfg: Config):
+class FFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_ff),
+            nn.Linear(d_model, d_ff),
             nn.GELU(),
-            nn.Linear(cfg.d_ff, cfg.d_model),
-            nn.Dropout(cfg.dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -421,90 +419,187 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: Config):
+    def __init__(self, d_model: int, n_head: int, d_ff: int, dropout: float):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
-        self.attn = CausalSelfAttention(cfg)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
-        self.mlp = MLP(cfg)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_head, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = FFN(d_model, d_ff, dropout)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.ffn(self.ln2(x))
         return x
 
 
 # ============================================================
-# Small models M(x, l)
+# Small-model variants for M
 # ============================================================
 
-class IdentityM(nn.Module):
-    def __init__(self, d_model: int):
+class MLP1M(nn.Module):
+    def __init__(self, in_dim: int, d_model: int, hidden_dim: int, dropout: float):
         super().__init__()
-        self.d_model = d_model
-
-    def forward(self, x0, layer_cond):
-        del layer_cond
-        return x0
-
-
-class MLPM(nn.Module):
-    def __init__(self, cfg: Config):
-        super().__init__()
-        in_dim = cfg.d_model + cfg.layer_embed_dim
         self.net = nn.Sequential(
-            nn.Linear(in_dim, cfg.m_hidden_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.SiLU(),
-            nn.Dropout(cfg.m_dropout),
-            nn.Linear(cfg.m_hidden_dim, cfg.d_model),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
         )
 
-    def forward(self, x0, layer_cond):
-        B, T, _ = x0.shape
-        layer_cond = layer_cond[:, None, :].expand(B, T, -1)
-        h = torch.cat([x0, layer_cond], dim=-1)
-        return self.net(h)
+    def forward(self, x):
+        return self.net(x)
+
+
+class MLP2M(nn.Module):
+    def __init__(self, in_dim: int, d_model: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TinyTransformerSubBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int, d_ff: int, dropout: float, use_ffn: bool):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_head, dropout)
+        self.use_ffn = use_ffn
+        if use_ffn:
+            self.ln2 = nn.LayerNorm(d_model)
+            self.ffn = FFN(d_model, d_ff, dropout)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        if self.use_ffn:
+            x = x + self.ffn(self.ln2(x))
+        return x
 
 
 class TinyTransformerM(nn.Module):
+    def __init__(self, in_dim: int, d_model: int, n_head: int, d_ff: int, dropout: float, num_layers: int, use_ffn: bool):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, d_model)
+        self.blocks = nn.ModuleList([
+            TinyTransformerSubBlock(d_model, n_head, d_ff, dropout, use_ffn=use_ffn)
+            for _ in range(num_layers)
+        ])
+        self.out_ln = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        h = self.in_proj(x)
+        for block in self.blocks:
+            h = block(h)
+        return self.out_proj(self.out_ln(h))
+
+
+class OriginalSmallModel(nn.Module):
+    """
+    Computes M(x,l) for one layer at a time.
+    Input shape:
+        x0:         (B, T, d_model)
+        layer_cond: (B, layer_embed_dim)
+    Output:
+        m:          (B, T, d_model)
+    """
     def __init__(self, cfg: Config):
         super().__init__()
-        self.in_proj = nn.Linear(cfg.d_model + cfg.layer_embed_dim, cfg.d_model)
+        in_dim = cfg.d_model + cfg.layer_embed_dim
+        mv = cfg.m_variant
 
-        tiny_cfg = Config(**asdict(cfg))
-        tiny_cfg.n_head = cfg.m_num_heads
-        tiny_cfg.dropout = cfg.m_dropout
-
-        self.blocks = nn.ModuleList([TransformerBlock(tiny_cfg) for _ in range(cfg.m_num_layers)])
-        self.out_ln = nn.LayerNorm(cfg.d_model)
-        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
+        if mv == "mlp1":
+            self.model = MLP1M(in_dim, cfg.d_model, cfg.m_hidden_dim, cfg.m_dropout)
+        elif mv == "mlp2":
+            self.model = MLP2M(in_dim, cfg.d_model, cfg.m_hidden_dim, cfg.m_dropout)
+        elif mv == "tf1":
+            self.model = TinyTransformerM(in_dim, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=1, use_ffn=True)
+        elif mv == "tf2":
+            self.model = TinyTransformerM(in_dim, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=2, use_ffn=True)
+        elif mv == "tf1_nomlp":
+            self.model = TinyTransformerM(in_dim, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=1, use_ffn=False)
+        elif mv == "tf2_nomlp":
+            self.model = TinyTransformerM(in_dim, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=2, use_ffn=False)
+        else:
+            raise ValueError(f"Unknown m_variant: {mv}")
 
     def forward(self, x0, layer_cond):
         B, T, _ = x0.shape
-        layer_cond = layer_cond[:, None, :].expand(B, T, -1)
-        h = torch.cat([x0, layer_cond], dim=-1)
-        h = self.in_proj(h)
-        for block in self.blocks:
-            h = block(h)
-        h = self.out_proj(self.out_ln(h))
-        return h
+        lc = layer_cond[:, None, :].expand(B, T, -1)
+        return self.model(torch.cat([x0, lc], dim=-1))
 
+
+class SharedSmallModel(nn.Module):
+    """
+    Computes one shared representation after warmup layers, then up-projects to
+    all later layers at once.
+
+    Input:
+        h_shared: (B, T, d_model)
+    Output:
+        m_all:    (B, T, n_target_layers, d_model)
+    """
+    def __init__(self, cfg: Config, n_target_layers: int):
+        super().__init__()
+        self.n_target_layers = n_target_layers
+        mv = cfg.m_variant
+
+        if mv == "mlp1":
+            self.shared = MLP1M(cfg.d_model, cfg.d_model, cfg.m_hidden_dim, cfg.m_dropout)
+        elif mv == "mlp2":
+            self.shared = MLP2M(cfg.d_model, cfg.d_model, cfg.m_hidden_dim, cfg.m_dropout)
+        elif mv == "tf1":
+            self.shared = TinyTransformerM(cfg.d_model, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=1, use_ffn=True)
+        elif mv == "tf2":
+            self.shared = TinyTransformerM(cfg.d_model, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=2, use_ffn=True)
+        elif mv == "tf1_nomlp":
+            self.shared = TinyTransformerM(cfg.d_model, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=1, use_ffn=False)
+        elif mv == "tf2_nomlp":
+            self.shared = TinyTransformerM(cfg.d_model, cfg.d_model, cfg.m_num_heads, cfg.m_hidden_dim, cfg.m_dropout, num_layers=2, use_ffn=False)
+        else:
+            raise ValueError(f"Unknown m_variant: {mv}")
+
+        self.up_project = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.shared_projector_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(cfg.m_dropout),
+            nn.Linear(cfg.shared_projector_hidden_dim, n_target_layers * cfg.d_model),
+        )
+
+    def forward(self, h_shared):
+        B, T, D = h_shared.shape
+        z = self.shared(h_shared)
+        out = self.up_project(z)
+        return out.view(B, T, self.n_target_layers, D)
+
+
+# ============================================================
+# Injector
+# ============================================================
 
 class Injector(nn.Module):
-    def __init__(self, cfg: Config):
+    def __init__(self, d_model: int, injection_type: str, scale_init: float):
         super().__init__()
-        self.injection_type = cfg.injection_type
-        self.scale = nn.Parameter(torch.tensor(float(cfg.injection_scale_init)))
+        self.injection_type = injection_type
+        self.scale = nn.Parameter(torch.tensor(float(scale_init)))
 
-        if cfg.injection_type == "gate":
+        if injection_type == "gate":
             self.gate = nn.Sequential(
-                nn.Linear(2 * cfg.d_model, cfg.d_model),
+                nn.Linear(2 * d_model, d_model),
                 nn.SiLU(),
-                nn.Linear(cfg.d_model, cfg.d_model),
+                nn.Linear(d_model, d_model),
                 nn.Sigmoid(),
             )
-        elif cfg.injection_type != "add":
-            raise ValueError(f"Unknown injection_type: {cfg.injection_type}")
+        elif injection_type != "add":
+            raise ValueError(f"Unknown injection_type: {injection_type}")
 
     def forward(self, h, m):
         if self.injection_type == "add":
@@ -517,7 +612,7 @@ class Injector(nn.Module):
 # Full model
 # ============================================================
 
-class DepthConditionedGPT(nn.Module):
+class DepthInjectionGPT(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
@@ -526,25 +621,34 @@ class DepthConditionedGPT(nn.Module):
         self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
 
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layer)])
+        self.blocks = nn.ModuleList([
+            TransformerBlock(cfg.d_model, cfg.n_head, cfg.d_ff, cfg.dropout)
+            for _ in range(cfg.n_layer)
+        ])
         self.ln_f = nn.LayerNorm(cfg.d_model)
-
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
 
         self.layer_embed = SinusoidalLayerEmbedding(cfg.layer_embed_dim, cfg.layer_embed_mlp_dim)
-        self.injectors = nn.ModuleList([Injector(cfg) for _ in range(cfg.n_layer)])
+        self.injectors = nn.ModuleList([
+            Injector(cfg.d_model, cfg.injection_type, cfg.injection_scale_init)
+            for _ in range(cfg.n_layer)
+        ])
 
-        if cfg.injection_mode == "none":
-            self.M = None
-        elif cfg.injection_mode == "identity":
-            self.M = IdentityM(cfg.d_model)
-        elif cfg.injection_mode == "mlp":
-            self.M = MLPM(cfg)
-        elif cfg.injection_mode == "tiny_tf":
-            self.M = TinyTransformerM(cfg)
+        if cfg.injection_family == "none":
+            self.small_model = None
+            self.shared_small_model = None
+        elif cfg.injection_family == "original":
+            self.small_model = OriginalSmallModel(cfg)
+            self.shared_small_model = None
+        elif cfg.injection_family == "shared":
+            n_target = cfg.n_layer - cfg.warmup_layers
+            if n_target <= 0:
+                raise ValueError("warmup_layers must be < n_layer for shared family.")
+            self.small_model = None
+            self.shared_small_model = SharedSmallModel(cfg, n_target_layers=n_target)
         else:
-            raise ValueError(f"Unknown injection_mode: {cfg.injection_mode}")
+            raise ValueError(f"Unknown injection_family: {cfg.injection_family}")
 
         self.apply(self._init_weights)
 
@@ -559,20 +663,37 @@ class DepthConditionedGPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        assert T <= self.cfg.max_seq_len, f"Sequence length {T} exceeds max_seq_len {self.cfg.max_seq_len}"
+        assert T <= self.cfg.max_seq_len
 
         pos = torch.arange(0, T, device=idx.device, dtype=torch.long)
         x0 = self.token_emb(idx)
-        h = x0 + self.pos_emb(pos)[None, :, :]
-        h = self.drop(h)
+        h = self.drop(x0 + self.pos_emb(pos)[None, :, :])
 
-        for l, block in enumerate(self.blocks):
-            if self.M is not None:
+        if self.cfg.injection_family == "none":
+            for block in self.blocks:
+                h = block(h)
+
+        elif self.cfg.injection_family == "original":
+            for l, block in enumerate(self.blocks):
                 layer_idx = torch.full((B,), l, device=idx.device, dtype=torch.long)
                 layer_cond = self.layer_embed(layer_idx)
-                m = self.M(x0, layer_cond)
+                m = self.small_model(x0, layer_cond)
                 h = self.injectors[l](h, m)
-            h = block(h)
+                h = block(h)
+
+        elif self.cfg.injection_family == "shared":
+            # Warmup layers: plain transformer
+            for l in range(self.cfg.warmup_layers):
+                h = self.blocks[l](h)
+
+            # Shared side computation once, then split into per-layer chunks
+            m_all = self.shared_small_model(h)  # (B, T, n_target, d_model)
+            target_idx = 0
+            for l in range(self.cfg.warmup_layers, self.cfg.n_layer):
+                m = m_all[:, :, target_idx, :]
+                h = self.injectors[l](h, m)
+                h = self.blocks[l](h)
+                target_idx += 1
 
         h = self.ln_f(h)
         logits = self.lm_head(h)
@@ -591,7 +712,6 @@ class DepthConditionedGPT(nn.Module):
 def estimate_loss(model, loader, device, max_batches=50):
     model.eval()
     losses = []
-
     for i, (x, y) in enumerate(loader):
         if i >= max_batches:
             break
@@ -599,7 +719,6 @@ def estimate_loss(model, loader, device, max_batches=50):
         y = y.to(device, non_blocking=True)
         _, loss = model(x, y)
         losses.append(loss.item())
-
     model.train()
     mean_loss = sum(losses) / max(1, len(losses))
     ppl = math.exp(mean_loss) if mean_loss < 20 else float("inf")
@@ -609,7 +728,6 @@ def estimate_loss(model, loader, device, max_batches=50):
 def make_optimizer(model: nn.Module, cfg: Config):
     decay_params = []
     no_decay_params = []
-
     for _, p in model.named_parameters():
         if not p.requires_grad:
             continue
@@ -617,7 +735,6 @@ def make_optimizer(model: nn.Module, cfg: Config):
             decay_params.append(p)
         else:
             no_decay_params.append(p)
-
     optim_groups = [
         {"params": decay_params, "weight_decay": cfg.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
@@ -635,16 +752,9 @@ def save_history(history: Dict[str, List[Any]], log_dir: str):
         writer = csv.writer(f)
         writer.writerow(["step", "train_loss", "val_loss", "val_ppl", "lr"])
         for s, tr, va, ppl, lr_ in zip(
-            history["step"],
-            history["train_loss"],
-            history["val_loss"],
-            history["val_ppl"],
-            history["lr"],
+            history["step"], history["train_loss"], history["val_loss"], history["val_ppl"], history["lr"]
         ):
             writer.writerow([s, tr, va, ppl, lr_])
-
-    print(f"Saved history JSON to {json_path}")
-    print(f"Saved history CSV to {csv_path}")
 
 
 def save_loss_plot(history: Dict[str, List[Any]], title: str, log_dir: str):
@@ -665,7 +775,6 @@ def save_loss_plot(history: Dict[str, List[Any]], title: str, log_dir: str):
     fig_path = os.path.join(log_dir, "loss.png")
     plt.savefig(fig_path, bbox_inches="tight")
     plt.close()
-    print(f"Saved loss plot to {fig_path}")
     return fig_path
 
 
@@ -701,7 +810,7 @@ def train_one_run(cfg: Config):
     run_name = build_run_name(cfg)
     wandb_run = maybe_init_wandb(cfg, run_name)
 
-    model = DepthConditionedGPT(cfg).to(device)
+    model = DepthInjectionGPT(cfg).to(device)
     if cfg.compile_model and hasattr(torch, "compile"):
         model = torch.compile(model)
 
@@ -712,10 +821,6 @@ def train_one_run(cfg: Config):
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Train tokens: {meta['train_tokens']:,}")
-    print(f"Val tokens:   {meta['val_tokens']:,}")
-    print(f"Model parameters: {n_params / 1e6:.2f}M")
-
     run_dir = os.path.join(cfg.out_dir, run_name)
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     log_dir = os.path.join(run_dir, "logs")
@@ -731,13 +836,7 @@ def train_one_run(cfg: Config):
         wandb.summary["model_parameters"] = n_params
         wandb.summary["run_dir"] = run_dir
 
-    history = {
-        "step": [],
-        "train_loss": [],
-        "val_loss": [],
-        "val_ppl": [],
-        "lr": [],
-    }
+    history = {"step": [], "train_loss": [], "val_loss": [], "val_ppl": [], "lr": []}
 
     model.train()
     best_val = float("inf")
@@ -798,7 +897,6 @@ def train_one_run(cfg: Config):
             history["lr"].append(float(lr))
 
             print(f"[eval] step {step:6d} | val loss {val_loss:.4f} | val ppl {val_ppl:.2f}")
-
             maybe_log_wandb(
                 {
                     "eval/loss": val_loss,
@@ -822,7 +920,6 @@ def train_one_run(cfg: Config):
                 best_path = os.path.join(ckpt_dir, "best.pt")
                 torch.save(ckpt, best_path)
                 print(f"Saved checkpoint to {best_path}")
-
                 if wandb_run is not None:
                     wandb.summary["best_val_loss"] = best_val
                     wandb.summary["best_step"] = step
@@ -839,54 +936,98 @@ def train_one_run(cfg: Config):
         wandb.save(loss_png_path)
 
     maybe_finish_wandb()
-    return model, history, run_dir
+    return model, history, run_dir, n_params
 
 
 # ============================================================
 # Ablation runner
 # ============================================================
 
+ABLATION_VARIANTS = [
+    "mlp1",
+    "mlp2",
+    "tf1",
+    "tf2",
+    "tf1_nomlp",
+    "tf2_nomlp",
+]
+
+
 def run_ablation_suite(base_cfg: Config):
-    modes = ["none", "identity", "mlp", "tiny_tf"]
     results = {}
 
-    for mode in modes:
-        print("\n" + "=" * 80)
-        print(f"Running ablation: injection_mode = {mode}")
-        print("=" * 80)
+    # Baseline
+    print("\n" + "=" * 90)
+    print("Running baseline: plain transformer")
+    print("=" * 90)
+    baseline_cfg = Config(**asdict(base_cfg))
+    baseline_cfg.injection_family = "none"
+    baseline_cfg.m_variant = "mlp1"
+    baseline_cfg.run_name = None
+    _, history, run_dir, n_params = train_one_run(baseline_cfg)
+    results[build_run_name(baseline_cfg)] = {
+        "history": history,
+        "run_dir": run_dir,
+        "n_params": n_params,
+        "family": "none",
+        "variant": "baseline",
+    }
 
+    # Original family
+    for mv in ABLATION_VARIANTS:
+        print("\n" + "=" * 90)
+        print(f"Running original family ablation: {mv}")
+        print("=" * 90)
         cfg = Config(**asdict(base_cfg))
-        cfg.injection_mode = mode
+        cfg.injection_family = "original"
+        cfg.m_variant = mv
         cfg.run_name = None
-        cfg.wandb_group = base_cfg.wandb_group
-
-        _, history, run_dir = train_one_run(cfg)
+        _, history, run_dir, n_params = train_one_run(cfg)
         results[build_run_name(cfg)] = {
             "history": history,
             "run_dir": run_dir,
-            "mode": mode,
+            "n_params": n_params,
+            "family": "original",
+            "variant": mv,
+        }
+
+    # Shared / up-projection family
+    for mv in ABLATION_VARIANTS:
+        print("\n" + "=" * 90)
+        print(f"Running shared family ablation: {mv}")
+        print("=" * 90)
+        cfg = Config(**asdict(base_cfg))
+        cfg.injection_family = "shared"
+        cfg.m_variant = mv
+        cfg.run_name = None
+        _, history, run_dir, n_params = train_one_run(cfg)
+        results[build_run_name(cfg)] = {
+            "history": history,
+            "run_dir": run_dir,
+            "n_params": n_params,
+            "family": "shared",
+            "variant": mv,
         }
 
     return results
 
 
 def plot_ablation_results(results: Dict[str, Dict[str, Any]], save_path: str):
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 7))
     for run_name, result in results.items():
         history = result["history"]
         val_steps = [s for s, v in zip(history["step"], history["val_loss"]) if v is not None]
         val_losses = [v for v in history["val_loss"] if v is not None]
-        plt.plot(val_steps, val_losses, label=run_name)
+        if len(val_steps) > 0:
+            plt.plot(val_steps, val_losses, label=run_name)
 
     plt.xlabel("step")
     plt.ylabel("validation loss")
     plt.title("TinyStories ablation comparison")
-    plt.legend()
+    plt.legend(fontsize=8)
     plt.grid(True, alpha=0.3)
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
-    print(f"Saved ablation comparison plot to {save_path}")
-
 
 
 def save_ablation_summary(results: Dict[str, Dict[str, Any]], save_path: str):
@@ -897,25 +1038,23 @@ def save_ablation_summary(results: Dict[str, Dict[str, Any]], save_path: str):
         ppl_values = [v for v in history["val_ppl"] if v is not None]
 
         if len(val_pairs) == 0:
-            best_step, best_val = None, None
-            final_val = None
-            final_ppl = None
+            best_step, best_val, final_val, final_ppl = None, None, None, None
         else:
             best_step, best_val = min(val_pairs, key=lambda x: x[1])
             final_val = val_pairs[-1][1]
             final_ppl = ppl_values[-1] if len(ppl_values) > 0 else None
 
-        rows.append(
-            {
-                "run_name": run_name,
-                "mode": result["mode"],
-                "best_val_loss": best_val,
-                "best_step": best_step,
-                "final_val_loss": final_val,
-                "final_val_ppl": final_ppl,
-                "run_dir": result["run_dir"],
-            }
-        )
+        rows.append({
+            "run_name": run_name,
+            "family": result["family"],
+            "variant": result["variant"],
+            "n_params": result["n_params"],
+            "best_val_loss": best_val,
+            "best_step": best_step,
+            "final_val_loss": final_val,
+            "final_val_ppl": final_ppl,
+            "run_dir": result["run_dir"],
+        })
 
     rows.sort(key=lambda x: float("inf") if x["best_val_loss"] is None else x["best_val_loss"])
 
@@ -924,7 +1063,9 @@ def save_ablation_summary(results: Dict[str, Dict[str, Any]], save_path: str):
             f,
             fieldnames=[
                 "run_name",
-                "mode",
+                "family",
+                "variant",
+                "n_params",
                 "best_val_loss",
                 "best_step",
                 "final_val_loss",
@@ -935,7 +1076,30 @@ def save_ablation_summary(results: Dict[str, Dict[str, Any]], save_path: str):
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Saved ablation summary to {save_path}")
+
+def save_familywise_plots(results: Dict[str, Dict[str, Any]], out_dir: str):
+    families = ["none", "original", "shared"]
+    for family in families:
+        plt.figure(figsize=(10, 6))
+        plotted = False
+        for run_name, result in results.items():
+            if result["family"] != family:
+                continue
+            history = result["history"]
+            val_steps = [s for s, v in zip(history["step"], history["val_loss"]) if v is not None]
+            val_losses = [v for v in history["val_loss"] if v is not None]
+            if len(val_steps) > 0:
+                plotted = True
+                plt.plot(val_steps, val_losses, label=run_name)
+        if plotted:
+            plt.xlabel("step")
+            plt.ylabel("validation loss")
+            plt.title(f"{family} family comparison")
+            plt.legend(fontsize=8)
+            plt.grid(True, alpha=0.3)
+            save_path = os.path.join(out_dir, f"ablation_{family}.png")
+            plt.savefig(save_path, bbox_inches="tight")
+        plt.close()
 
 
 # ============================================================
@@ -965,36 +1129,39 @@ if __name__ == "__main__":
         log_interval=20,
         injection_type="add",
         injection_scale_init=0.1,
+        warmup_layers=2,
         m_hidden_dim=512,
-        m_num_layers=2,
         m_num_heads=4,
+        shared_projector_hidden_dim=1024,
         num_proc=8,
         num_workers=4,
         compile_model=False,
         use_wandb=True,
         wandb_project="depth-injection",
         wandb_entity=None,
-        wandb_group="tinystories-ablation",
+        wandb_group="tinystories-ablation-full",
         wandb_job_type="train",
-        wandb_tags=("tinystories", "ablation", "depth-injection"),
+        wandb_tags=("tinystories", "ablation", "depth-injection", "shared-up-project"),
         wandb_mode="online",
     )
 
-    # pip install wandb
+    # pip install wandb datasets transformers tqdm matplotlib
     # wandb login
     results = run_ablation_suite(cfg)
 
-    ablation_plot_path = os.path.join(cfg.out_dir, "ablation_compare.png")
-    ablation_summary_path = os.path.join(cfg.out_dir, "ablation_summary.csv")
+    ensure_dir(cfg.out_dir)
+    ablation_plot_path = os.path.join(cfg.out_dir, "ablation_compare_all.png")
+    ablation_summary_path = os.path.join(cfg.out_dir, "ablation_summary_full.csv")
 
     plot_ablation_results(results, save_path=ablation_plot_path)
     save_ablation_summary(results, save_path=ablation_summary_path)
+    save_familywise_plots(results, out_dir=cfg.out_dir)
 
     if cfg.use_wandb and cfg.wandb_mode != "disabled":
         summary_run = wandb.init(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
-            name=f"{cfg.dataset_name}-ablation-summary",
+            name=f"{cfg.dataset_name}-ablation-summary-full",
             group=cfg.wandb_group,
             job_type="summary",
             tags=list(cfg.wandb_tags) + ["summary"],
@@ -1002,8 +1169,13 @@ if __name__ == "__main__":
             mode=cfg.wandb_mode,
         )
         if os.path.exists(ablation_plot_path):
-            wandb.log({"plots/ablation_compare": wandb.Image(ablation_plot_path)})
+            wandb.log({"plots/ablation_compare_all": wandb.Image(ablation_plot_path)})
             wandb.save(ablation_plot_path)
         if os.path.exists(ablation_summary_path):
             wandb.save(ablation_summary_path)
+        for family in ["none", "original", "shared"]:
+            p = os.path.join(cfg.out_dir, f"ablation_{family}.png")
+            if os.path.exists(p):
+                wandb.log({f"plots/{family}_family": wandb.Image(p)})
+                wandb.save(p)
         wandb.finish()
